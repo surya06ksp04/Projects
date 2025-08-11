@@ -1,0 +1,242 @@
+import os
+import math
+import random
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+import joblib
+
+# Configuration
+
+OUTPUT_DIR = "outputs"
+EXAMPLE_DIR = "example_data"
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+FESTIVALS = ["Diwali", "Christmas", "Eid"]
+REGIONS = ["North", "South", "East", "West"]
+YEARS = list(range(2017, 2024))  # historical years
+
+FESTIVAL_MONTH_DAY = {
+    "Diwali": (11, 1),      # early November (varies) - for synthetic purposes
+    "Christmas": (12, 25),  # Dec 25
+    "Eid": (5, 5),          # early May (varies widely)
+}
+
+# Utilities: synthetic data creation
+
+def make_dirs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(EXAMPLE_DIR, exist_ok=True)
+
+def generate_synthetic_time_series():
+    """Generate a synthetic daily time series for retail sales, flight bookings, and hotel prices.
+    The generation puts a festival 'window' around each festival date where metrics get a boost.
+    Saves a CSV to example_data/festival_daily.csv
+    """
+    rows = []
+
+    for year in YEARS:
+        for festival in FESTIVALS:
+            month, day = FESTIVAL_MONTH_DAY[festival]
+            anchor = datetime(year, month, min(day, 28)) + timedelta(days=random.randint(-3, 3))
+            window = 7  # days including festival day (3 days before, festival day, 3 after)
+            for region in REGIONS:
+                start = datetime(year, 1, 1)
+                end = datetime(year, 12, 31)
+                current = start
+                while current <= end:
+                    month_factor = 1 + 0.05 * math.sin((current.timetuple().tm_yday / 365.0) * 2 * math.pi)
+                    weekday = current.weekday()
+                    weekday_factor = 1 + (0.02 if weekday >= 5 else 0)  # slight weekend bump
+
+                    base_retail = 1000 + (50 * (year - YEARS[0]))  # small growth each year
+                    base_flights = 50 + (2 * (year - YEARS[0]))
+                    base_hotel = 200 + (5 * (year - YEARS[0]))
+
+                    region_mult = {
+                        "North": 1.05,
+                        "South": 0.95,
+                        "East": 0.9,
+                        "West": 1.1,
+                    }[region]
+
+                    retail = base_retail * month_factor * weekday_factor * region_mult
+                    flights = base_flights * month_factor * weekday_factor * (region_mult * 0.08)
+                    hotel = base_hotel * month_factor * weekday_factor * (0.5 + 0.5 * region_mult)
+
+                    retail *= np.random.normal(1.0, 0.05)
+                    flights *= np.random.normal(1.0, 0.15)
+                    hotel *= np.random.normal(1.0, 0.08)
+
+                    days_from_anchor = (current - anchor).days
+                    if abs(days_from_anchor) <= 3:
+                        festival_boosts = {
+                            "Diwali": {"retail": 0.40, "flights": 0.25, "hotel": 0.20},
+                            "Christmas": {"retail": 0.35, "flights": 0.30, "hotel": 0.25},
+                            "Eid": {"retail": 0.20, "flights": 0.15, "hotel": 0.12},
+                        }
+                        boost = festival_boosts[festival]
+                        day_weight = max(0.3, 1 - (abs(days_from_anchor) / 3.0))
+                        retail *= (1 + boost["retail"] * day_weight)
+                        flights *= (1 + boost["flights"] * day_weight)
+                        hotel *= (1 + boost["hotel"] * day_weight)
+
+                    rows.append({
+                        "date": current.strftime("%Y-%m-%d"),
+                        "year": year,
+                        "region": region,
+                        "festival": festival,
+                        "retail_sales": round(retail, 2),
+                        "flight_bookings": max(0, int(round(flights))),
+                        "avg_hotel_price": round(hotel, 2),
+                        "days_from_festival": days_from_anchor,
+                        "is_festival_window": abs(days_from_anchor) <= 3,
+                    })
+
+                    current += timedelta(days=1)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(EXAMPLE_DIR, "festival_daily.csv"), index=False)
+    print("Saved example data to", os.path.join(EXAMPLE_DIR, "festival_daily.csv"))
+    return df
+
+# Analysis: compute festival boost
+
+def compute_festival_boost(df, metric="retail_sales"):
+
+    records = []
+    grouped = df.groupby(["festival", "year", "region"]) 
+    for (festival, year, region), g in grouped:
+        baseline_window = g[(g["days_from_festival"] >= -31) & (g["days_from_festival"] <= -4)]
+        festival_window = g[(g["days_from_festival"] >= -3) & (g["days_from_festival"] <= 3)]
+        if len(baseline_window) < 7 or len(festival_window) == 0:
+            continue
+        baseline_mean = baseline_window[metric].mean()
+        during_mean = festival_window[metric].mean()
+        pct_boost = (during_mean - baseline_mean) / baseline_mean * 100
+        records.append({
+            "festival": festival,
+            "year": year,
+            "region": region,
+            "baseline_mean": baseline_mean,
+            "during_mean": during_mean,
+            "pct_boost": pct_boost,
+        })
+    out = pd.DataFrame(records)
+    return out
+
+# Predicting next-year surge
+
+def prepare_model_data(boost_df):
+
+    df = boost_df.copy()
+    # sort
+    df = df.sort_values(["festival", "region", "year"]) 
+    # create lag of previous year boost
+    df["prev_year_boost"] = df.groupby(["festival", "region"])['pct_boost'].shift(1)
+    # encode festival and region as categorical codes
+    df['festival_code'] = df['festival'].astype('category').cat.codes
+    df['region_code'] = df['region'].astype('category').cat.codes
+    # drop rows without prev_year_boost (can't predict without history)
+    df = df.dropna(subset=['prev_year_boost'])
+    # feature set
+    X = df[['prev_year_boost', 'festival_code', 'region_code', 'year']]
+    y = df['pct_boost']
+    return X, y, df
+
+
+def train_and_evaluate(X, y):
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=RANDOM_SEED)
+    model = RandomForestRegressor(n_estimators=200, random_state=RANDOM_SEED)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    mae = mean_absolute_error(y_test, preds)
+    r2 = r2_score(y_test, preds)
+    return model, mae, r2, X_test, y_test, preds
+
+# Visualization 
+
+def plot_boost_over_time(boost_df):
+    plt.figure(figsize=(10, 5))
+    for fest in boost_df['festival'].unique():
+        sub = boost_df[boost_df['festival'] == fest].groupby('year')['pct_boost'].mean()
+        plt.plot(sub.index, sub.values, marker='o', label=fest)
+    plt.xlabel('Year')
+    plt.ylabel('Mean percent boost (retail_sales)')
+    plt.title('Festival boost over time (mean across regions)')
+    plt.legend()
+    plt.tight_layout()
+    outpath = os.path.join(OUTPUT_DIR, 'boost_over_time.png')
+    plt.savefig(outpath)
+    print('Saved plot to', outpath)
+    plt.close()
+
+# Putting it all together
+
+def main():
+    make_dirs()
+    csv_path = os.path.join(EXAMPLE_DIR, 'festival_daily.csv')
+    if not os.path.exists(csv_path):
+        df = generate_synthetic_time_series()
+    else:
+        df = pd.read_csv(csv_path)
+        print('Loaded existing example data from', csv_path)
+
+    print('\nData sample:')
+    print(df.head().to_string(index=False))
+
+    boost_df = compute_festival_boost(df, metric='retail_sales')
+    boost_csv = os.path.join(OUTPUT_DIR, 'festival_boost_retail.csv')
+    boost_df.to_csv(boost_csv, index=False)
+    print('\nSaved festival boost per festival-year-region to', boost_csv)
+
+    plot_boost_over_time(boost_df)
+
+    X, y, model_df = prepare_model_data(boost_df)
+    print('\nModeling rows (example):')
+    print(model_df.head().to_string(index=False))
+
+    model, mae, r2, X_test, y_test, preds = train_and_evaluate(X, y)
+    print(f"\nTrained RandomForest - MAE: {mae:.2f} percentage points, R2: {r2:.3f}")
+
+    model_path = os.path.join(OUTPUT_DIR, 'rf_boost_model.joblib')
+    joblib.dump(model, model_path)
+    print('Saved model to', model_path)
+
+    next_year = df['year'].max() + 1
+    pred_rows = []
+    # we need prev_year_boost for each festival-region
+    last_boost = boost_df.sort_values('year').groupby(['festival', 'region']).tail(1)
+    for _, row in last_boost.iterrows():
+        prev = row['pct_boost']
+        fest = row['festival']
+        region = row['region']
+        fest_code = model_df[model_df['festival'] == fest]['festival_code'].iloc[0]
+        region_code = model_df[model_df['region'] == region]['region_code'].iloc[0]
+        pred_rows.append({
+            'festival': fest,
+            'region': region,
+            'year': next_year,
+            'prev_year_boost': prev,
+            'festival_code': fest_code,
+            'region_code': region_code,
+        })
+    pred_df = pd.DataFrame(pred_rows)
+    X_pred = pred_df[['prev_year_boost', 'festival_code', 'region_code', 'year']]
+    pred_df['pred_pct_boost'] = model.predict(X_pred)
+
+    pred_out_csv = os.path.join(OUTPUT_DIR, f'predicted_boost_{next_year}.csv')
+    pred_df.to_csv(pred_out_csv, index=False)
+    print('\nSaved next-year predictions to', pred_out_csv)
+
+    top_preds = pred_df.sort_values('pred_pct_boost', ascending=False).head(10)
+    print('\nTop predicted festival surges for next year:')
+    print(top_preds[['festival', 'region', 'pred_pct_boost']].to_string(index=False))
